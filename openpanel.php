@@ -5,20 +5,20 @@
 # Source: https://github.com/stefanpejcic/openpanel-paymenter.org
 # Author: Stefan Pejcic
 # Created: 09.10.2024
-# Last Modified: 09.10.2024
+# Last Modified: 21.05.2025
 # Company: openpanel.com
 # Copyright (c) Stefan Pejcic
-# 
+#
 # Permission is hereby granted, free of charge, to any person obtaining a copy
 # of this software and associated documentation files (the "Software"), to deal
 # in the Software without restriction, including without limitation the rights
 # to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
 # copies of the Software, and to permit persons to whom the Software is
 # furnished to do so, subject to the following conditions:
-# 
+#
 # The above copyright notice and this permission notice shall be included in
 # all copies or substantial portions of the Software.
-# 
+#
 # THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
 # IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
 # FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
@@ -40,33 +40,39 @@ class OpenPanel extends Server
     {
         return [
             'display_name' => 'OpenPanel',
-            'version' => '1.0.0',
+            'version' => '1.1.0',
             'author' => 'Paymenter',
             'website' => 'https://paymenter.org',
         ];
     }
-    
+
     public function getConfig()
     {
         return [
             [
                 'name' => 'host',
-                'friendlyName' => 'Url to OpenPanel server (with port)',
+                'friendlyName' => 'URL to OpenPanel server (hostname or IP, without port)',
                 'type' => 'text',
                 'required' => true,
             ],
             [
+                'name' => 'port',
+                'friendlyName' => 'Port (default: 2087)',
+                'type' => 'text',
+                'required' => false,
+            ],
+            [
                 'name' => 'username',
-                'friendlyName' => 'Username',
+                'friendlyName' => 'Admin Username',
                 'type' => 'text',
                 'required' => true,
             ],
             [
                 'name' => 'password',
-                'friendlyName' => 'Password',
+                'friendlyName' => 'Admin Password',
                 'type' => 'text',
                 'required' => true,
-            ]
+            ],
         ];
     }
 
@@ -78,7 +84,7 @@ class OpenPanel extends Server
                 'friendlyName' => 'Package Name',
                 'type' => 'text',
                 'required' => true,
-                'description' => 'Package Name for the OpenPanel server',
+                'description' => 'Package/plan name as configured on the OpenPanel server',
             ],
         ];
     }
@@ -91,118 +97,204 @@ class OpenPanel extends Server
                 'friendlyName' => 'Domain',
                 'type' => 'text',
                 'required' => true,
-                'description' => 'Domain for the webhost',
+                'description' => 'Primary domain for the hosting account',
             ],
             [
                 'name' => 'username',
                 'friendlyName' => 'Username',
                 'type' => 'text',
                 'required' => true,
-                'description' => 'Username to login to the website',
+                'description' => 'Username for the OpenPanel account',
             ],
             [
                 'name' => 'password',
                 'friendlyName' => 'Password',
                 'type' => 'text',
                 'required' => true,
-                'description' => 'Password to login to the website',
-            ]
+                'description' => 'Password for the OpenPanel account',
+            ],
         ];
     }
 
+
     public function createServer($user, $params, $order, $product, $configurableOptions)
     {
-        list($jwtToken, $error) = $this->getAuthToken();
-        
+        [$jwtToken, $error] = $this->getAuthToken($params);
         if (!$jwtToken) {
             ExtensionHelper::error('OpenPanel', 'Failed to get authentication token: ' . $error);
             return;
         }
-        
-        $createUserEndpoint = $this->getApiProtocol($params["host"]) . $params["host"] . ':2087/api/users';
-        $response = Http::withToken($jwtToken)
-            ->post($createUserEndpoint, [
+
+        // 1. Create the user account
+        $response = $this->apiRequest($params, $jwtToken, 'POST', '/api/users', [
+            'username'  => $params['config']['username'],
+            'password'  => $params['config']['password'],
+            'email'     => $user->email,
+            'plan_name' => $params['packageName'],
+        ]);
+
+        if (!isset($response['success']) || !$response['success']) {
+            ExtensionHelper::error('OpenPanel', 'Failed to create user: ' . ($response['error'] ?? json_encode($response)));
+            return;
+        }
+
+        // 2. Add the domain if provided
+        if (!empty($params['config']['domain'])) {
+            $domainResponse = $this->apiRequest($params, $jwtToken, 'POST', '/api/domains/new', [
                 'username' => $params['config']['username'],
-                'password' => $params['config']['password'],
-                'email' => $user->email,
-                'plan_name' => $params['packageName'],
+                'domain'   => $params['config']['domain'],
+                'docroot'  => '/var/www/html/' . $params['config']['domain'],
             ]);
 
-        if (!$response->successful()) {
-            ExtensionHelper::error('OpenPanel', 'Failed to create server: ' . $response->body());
+            if (isset($domainResponse['error'])) {
+                ExtensionHelper::error('OpenPanel', 'User created, but failed to add domain: ' . $domainResponse['error']);
+            }
         }
     }
 
     public function suspendServer($user, $params, $order, $product, $configurableOptions)
     {
-        list($jwtToken, $error) = $this->getAuthToken();
-
+        [$jwtToken, $error] = $this->getAuthToken($params);
         if (!$jwtToken) {
             ExtensionHelper::error('OpenPanel', 'Failed to get authentication token: ' . $error);
             return;
         }
 
-        $suspendUserEndpoint = $this->getApiProtocol($params["host"]) . $params["host"] . ':2087/api/users/' . $params["config"]["username"] . '/suspend';
-        $response = Http::withToken($jwtToken)->patch($suspendUserEndpoint);
+        $response = $this->apiRequest($params, $jwtToken, 'PATCH', '/api/users/' . $params['config']['username'], [
+            'action' => 'suspend',
+        ]);
 
-        if (!$response->successful()) {
-            ExtensionHelper::error('OpenPanel', 'Failed to suspend server: ' . $response->body());
+        if (!isset($response['success']) || !$response['success']) {
+            ExtensionHelper::error('OpenPanel', 'Failed to suspend server: ' . ($response['error'] ?? json_encode($response)));
         }
     }
 
     public function unsuspendServer($user, $params, $order, $product, $configurableOptions)
     {
-        list($jwtToken, $error) = $this->getAuthToken();
-
+        [$jwtToken, $error] = $this->getAuthToken($params);
         if (!$jwtToken) {
             ExtensionHelper::error('OpenPanel', 'Failed to get authentication token: ' . $error);
             return;
         }
 
-        $unsuspendUserEndpoint = $this->getApiProtocol($params["host"]) . $params["host"] . ':2087/api/users/' . $params["config"]["username"] . '/unsuspend';
-        $response = Http::withToken($jwtToken)->patch($unsuspendUserEndpoint);
+        $response = $this->apiRequest($params, $jwtToken, 'PATCH', '/api/users/' . $params['config']['username'], [
+            'action' => 'unsuspend',
+        ]);
 
-        if (!$response->successful()) {
-            ExtensionHelper::error('OpenPanel', 'Failed to unsuspend server: ' . $response->body());
+        if (!isset($response['success']) || !$response['success']) {
+            ExtensionHelper::error('OpenPanel', 'Failed to unsuspend server: ' . ($response['error'] ?? json_encode($response)));
         }
     }
 
     public function terminateServer($user, $params, $order, $product, $configurableOptions)
     {
-        list($jwtToken, $error) = $this->getAuthToken();
-
+        [$jwtToken, $error] = $this->getAuthToken($params);
         if (!$jwtToken) {
             ExtensionHelper::error('OpenPanel', 'Failed to get authentication token: ' . $error);
             return;
         }
 
-        $deleteUserEndpoint = $this->getApiProtocol($params["host"]) . $params["host"] . ':2087/api/users/' . $params["config"]["username"];
-        $response = Http::withToken($jwtToken)->delete($deleteUserEndpoint);
+        // Unsuspend first (ensures account is active before deletion)
+        $this->apiRequest($params, $jwtToken, 'PATCH', '/api/users/' . $params['config']['username'], [
+            'action' => 'unsuspend',
+        ]);
 
-        if (!$response->successful()) {
-            ExtensionHelper::error('OpenPanel', 'Failed to terminate server: ' . $response->body());
+        $response = $this->apiRequest($params, $jwtToken, 'DELETE', '/api/users/' . $params['config']['username']);
+
+        if (!isset($response['success']) || !$response['success']) {
+            ExtensionHelper::error('OpenPanel', 'Failed to terminate server: ' . ($response['error'] ?? json_encode($response)));
         }
     }
 
-    private function getApiProtocol($hostname)
+    public function changePackage($user, $params, $order, $product, $configurableOptions)
     {
-        return filter_var($hostname, FILTER_VALIDATE_IP) === false ? 'https://' : 'http://';
+        [$jwtToken, $error] = $this->getAuthToken($params);
+        if (!$jwtToken) {
+            ExtensionHelper::error('OpenPanel', 'Failed to get authentication token: ' . $error);
+            return;
+        }
+
+        $response = $this->apiRequest($params, $jwtToken, 'PUT', '/api/users/' . $params['config']['username'], [
+            'plan_name' => $params['packageName'],
+        ]);
+
+        if (!isset($response['success']) || !$response['success']) {
+            ExtensionHelper::error('OpenPanel', 'Failed to change package: ' . ($response['error'] ?? json_encode($response)));
+        }
     }
 
-    private function getAuthToken()
+    public function changePassword($user, $params, $order, $product, $configurableOptions)
     {
-        $authEndpoint = $this->getApiProtocol(ExtensionHelper::getConfig('OpenPanel', 'host')) . ExtensionHelper::getConfig('OpenPanel', 'host') . ':2087/api/auth';
-        
+        [$jwtToken, $error] = $this->getAuthToken($params);
+        if (!$jwtToken) {
+            ExtensionHelper::error('OpenPanel', 'Failed to get authentication token: ' . $error);
+            return;
+        }
+
+        $response = $this->apiRequest($params, $jwtToken, 'PATCH', '/api/users/' . $params['config']['username'], [
+            'password' => $params['config']['password'],
+        ]);
+
+        if (!isset($response['success']) || !$response['success']) {
+            ExtensionHelper::error('OpenPanel', 'Failed to change password: ' . ($response['error'] ?? json_encode($response)));
+        }
+    }
+
+    /**
+     * Returns the base URL for the API, using https for hostnames and http for raw IP addresses
+     */
+    private function getBaseUrl(array $params): string
+    {
+        $host     = ExtensionHelper::getConfig('OpenPanel', 'host');
+        $port     = ExtensionHelper::getConfig('OpenPanel', 'port') ?: 2087;
+        $protocol = filter_var($host, FILTER_VALIDATE_IP) !== false ? 'http://' : 'https://';
+
+        return $protocol . $host . ':' . $port;
+    }
+
+    /**
+     * Authenticates with the OpenAdmin API and returns [token, error].
+     */
+    private function getAuthToken(array $params = []): array
+    {
+        $authEndpoint = $this->getBaseUrl($params) . '/api/';
+
         $response = Http::post($authEndpoint, [
             'username' => ExtensionHelper::getConfig('OpenPanel', 'username'),
             'password' => ExtensionHelper::getConfig('OpenPanel', 'password'),
         ]);
 
         if (!$response->successful()) {
-            return [false, 'Failed to authenticate: ' . $response->body()];
+            return [false, 'HTTP ' . $response->status() . ': ' . $response->body()];
         }
 
-        $responseData = $response->json();
-        return [$responseData['access_token'] ?? false, 'Token not found in response'];
+        $data = $response->json();
+
+        if (!isset($data['access_token'])) {
+            return [false, 'Token not found in response: ' . $response->body()];
+        }
+
+        return [$data['access_token'], null];
+    }
+
+    /**
+     * Executes an authenticated API request and returns the decoded JSON body.
+     */
+    private function apiRequest(array $params, string $token, string $method, string $uri, array $data = []): array
+    {
+        $url = $this->getBaseUrl($params) . $uri;
+
+        $request = Http::withToken($token);
+
+        $response = match (strtoupper($method)) {
+            'GET'    => $request->get($url),
+            'POST'   => $request->post($url, $data),
+            'PATCH'  => $request->patch($url, $data),
+            'PUT'    => $request->put($url, $data),
+            'DELETE' => $request->delete($url),
+            default  => $request->post($url, $data),
+        };
+
+        return $response->json() ?? [];
     }
 }
